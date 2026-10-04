@@ -243,9 +243,156 @@ def _ts(ts) -> str:
         return str(ts)
 
 
+# ---------------------------------------------------------------------------
+# Normalisation — the share API serves the message body in two shapes:
+#   * legacy:  {"role": ..., "content": "...", "thinking_content": "..."}
+#   * current: {"role": ..., "fragments": [{"type": "REQUEST|THINK|RESPONSE",
+#              "content": "...", "references": [...]}]}
+# Both are handled here so the formatters only ever see one shape.
+# ---------------------------------------------------------------------------
+
+THINK_FRAGMENT_TYPES = {"THINK", "THINKING", "REASONING", "REASON"}
+SEARCH_FRAGMENT_TYPES = {"SEARCH", "SEARCH_RESULT", "SEARCH_RESULTS"}
+
+_REFERENCE_WRAPPERS = ("search_result", "reference", "result", "webpage", "site", "source")
+
+
+def _biz_data(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    node = data.get("data")
+    if not isinstance(node, dict):
+        return {}
+    biz = node.get("biz_data")
+    return biz if isinstance(biz, dict) else {}
+
+
+def _messages(data: dict) -> list:
+    biz = _biz_data(data)
+    messages = biz.get("messages")
+    if not isinstance(messages, list) or not messages:
+        messages = biz.get("chat_messages")
+    if not isinstance(messages, list):
+        messages = []
+    return [m for m in messages if isinstance(m, dict)]
+
+
+def _normalize_references(raw) -> list:
+    """Flatten whatever shape the API used for citations into {url, title, snippet}."""
+    if not raw:
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+
+    out, seen = [], set()
+    for item in raw:
+        if isinstance(item, str):
+            item = {"url": item}
+        if not isinstance(item, dict):
+            continue
+
+        src = item
+        for key in _REFERENCE_WRAPPERS:
+            if isinstance(item.get(key), dict):
+                src = item[key]
+                break
+
+        url = src.get("url") or src.get("link") or src.get("source_url") or ""
+        title = src.get("title") or src.get("name") or ""
+        snippet = src.get("snippet") or src.get("summary") or src.get("description") or ""
+        if not url and not title:
+            continue
+        marker = url or title
+        if marker in seen:
+            continue
+        seen.add(marker)
+        out.append({"url": url, "title": title, "snippet": snippet})
+    return out
+
+
+def parse_message(msg: dict) -> dict:
+    role = (msg.get("role") or "").upper()
+    fragments = msg.get("fragments")
+
+    if isinstance(fragments, list) and fragments:
+        content_parts: list[str] = []
+        thinking_parts: list[str] = []
+        search_notes: list[str] = []
+        references: list[dict] = []
+        elapsed = None
+
+        for frag in fragments:
+            if not isinstance(frag, dict):
+                continue
+            ftype = (frag.get("type") or "").upper()
+            text = frag.get("content") or ""
+            refs = _normalize_references(frag.get("references"))
+
+            if ftype in THINK_FRAGMENT_TYPES:
+                if text:
+                    thinking_parts.append(text)
+                secs = frag.get("elapsed_secs")
+                if isinstance(secs, (int, float)):
+                    elapsed = (elapsed or 0.0) + float(secs)
+            elif ftype in SEARCH_FRAGMENT_TYPES:
+                if refs:
+                    references.extend(refs)
+                if text:
+                    search_notes.append(text)
+            else:
+                if text:
+                    content_parts.append(text)
+                references.extend(refs)
+
+        return {
+            "role": role,
+            "content": "\n\n".join(content_parts),
+            "thinking": "\n\n".join(thinking_parts),
+            "elapsed": elapsed,
+            "references": _normalize_references(references),
+            "search_notes": search_notes,
+            "timestamp": _ts(msg.get("inserted_at")),
+        }
+
+    return {
+        "role": role,
+        "content": msg.get("content") or msg.get("message") or "",
+        "thinking": msg.get("thinking_content") or msg.get("reasoning_content") or "",
+        "elapsed": msg.get("thinking_elapsed_secs"),
+        "references": _normalize_references(msg.get("search_results") or msg.get("references")),
+        "search_notes": [],
+        "timestamp": _ts(msg.get("inserted_at")),
+    }
+
+
+def _role_header(role: str) -> str:
+    if role == "USER":
+        return "You"
+    if role in ("ASSISTANT", "AI", "BOT"):
+        return "DeepSeek"
+    if role == "SYSTEM":
+        return "System"
+    return role.title() or "Message"
+
+
+def _sources_block(references: list) -> str:
+    lines = []
+    for ref in references:
+        url, title = ref.get("url") or "", ref.get("title") or ""
+        if url and title:
+            lines.append(f"- [{title}]({url})")
+        elif url:
+            lines.append(f"- {url}")
+        elif title:
+            lines.append(f"- {title}")
+    return "\n".join(lines)
+
+
 def to_markdown(data: dict) -> str:
-    biz = data.get("data", {}).get("biz_data", {})
-    messages = biz.get("messages", []) or biz.get("chat_messages", [])
+    biz = _biz_data(data)
+    messages = _messages(data)
 
     title = biz.get("title") or "DeepSeek Conversation"
     model = biz.get("model_type") or biz.get("model") or ""
@@ -260,39 +407,28 @@ def to_markdown(data: dict) -> str:
         return "\n".join(parts)
 
     for msg in messages:
-        role = (msg.get("role") or "").upper()
-        content = msg.get("content") or msg.get("message") or ""
+        parsed = parse_message(msg)
+        role = parsed["role"]
+        content = parsed["content"]
         if not content and not role:
             continue
 
-        thinking = msg.get("thinking_content") or msg.get("reasoning_content") or ""
-        elapsed = msg.get("thinking_elapsed_secs")
-        search = msg.get("search_results") or []
+        parts.append(f"## {_role_header(role)}\n")
 
-        if role == "USER":
-            header = "You"
-        elif role in ("ASSISTANT", "AI"):
-            header = "DeepSeek"
-        elif role == "SYSTEM":
-            header = "System"
-        else:
-            header = role.title()
+        if parsed["timestamp"]:
+            parts.append(f"_{parsed['timestamp']}_\n")
 
-        parts.append(f"## {header}\n")
+        if parsed["thinking"]:
+            secs = parsed["elapsed"]
+            label = f"Thinking ({secs:.0f}s)" if isinstance(secs, (int, float)) and secs else "Thinking"
+            parts.append(f"<details><summary>{label}</summary>\n\n{parsed['thinking']}\n\n</details>\n")
 
-        if thinking:
-            label = f"Thinking ({elapsed}s)" if elapsed else "Thinking"
-            parts.append(f"<details><summary>{label}</summary>\n\n{thinking}\n\n</details>\n")
+        for note in parsed["search_notes"]:
+            parts.append(f"<details><summary>Search</summary>\n\n{note}\n\n</details>\n")
 
-        if search:
-            refs = []
-            for item in search:
-                t = item.get("title") or ""
-                u = item.get("url") or ""
-                if u:
-                    refs.append(f"- [{t}]({u})" if t else f"- {u}")
-            if refs:
-                parts.append("**Sources:**\n" + "\n".join(refs) + "\n")
+        refs = _sources_block(parsed["references"])
+        if refs:
+            parts.append("**Sources:**\n" + refs + "\n")
 
         if content:
             parts.append(f"{content}\n")
@@ -302,23 +438,24 @@ def to_markdown(data: dict) -> str:
 
 
 def to_plain_text(data: dict) -> str:
-    biz = data.get("data", {}).get("biz_data", {})
-    messages = biz.get("messages", []) or biz.get("chat_messages", [])
+    biz = _biz_data(data)
+    messages = _messages(data)
     title = biz.get("title") or "DeepSeek Conversation"
 
     parts = [f"=== {title} ===\n"]
     for msg in messages:
-        role = (msg.get("role") or "").upper()
-        content = msg.get("content") or msg.get("message") or ""
-        thinking = msg.get("thinking_content") or msg.get("reasoning_content") or ""
-        if role == "USER":
-            parts.append(f"[User]\n{content}\n")
-        elif role in ("ASSISTANT", "AI"):
-            if thinking:
-                parts.append(f"[Thinking]\n{thinking}\n")
+        parsed = parse_message(msg)
+        role = parsed["role"]
+        content = parsed["content"]
+        header = _role_header(role)
+        if role in ("ASSISTANT", "AI", "BOT"):
+            if parsed["thinking"]:
+                parts.append(f"[Thinking]\n{parsed['thinking']}\n")
             parts.append(f"[DeepSeek]\n{content}\n")
+        elif role == "USER":
+            parts.append(f"[User]\n{content}\n")
         else:
-            parts.append(f"[{role}]\n{content}\n")
+            parts.append(f"[{header}]\n{content}\n")
     return "\n".join(parts)
 
 
