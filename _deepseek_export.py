@@ -11,6 +11,8 @@ Usage (just run it — venv is created automatically):
 Examples:
     python deepseek_export.py https://chat.deepseek.com/share/nvy7v2ps1r6e2wyoyj
     python deepseek_export.py nvy7v2ps1r6e2wyoyj -o my_chat.md
+    python deepseek_export.py nvy7v2ps1r6e2wyoyj -o my_chat        # -> my_chat.md
+    python deepseek_export.py nvy7v2ps1r6e2wyoyj -o chat --json    # -> chat.json
     python deepseek_export.py nvy7v2ps1r6e2wyoyj --json -o chat.json
     python deepseek_export.py nvy7v2ps1r6e2wyoyj --txt
 
@@ -471,13 +473,47 @@ class _ArgumentParser(argparse.ArgumentParser):
         sys.exit(2)
 
 
+FORMAT_EXTENSIONS = {"md": ".md", "json": ".json", "txt": ".txt"}
+
+
+def output_format(args) -> str:
+    if args.json:
+        return "json"
+    if args.txt:
+        return "txt"
+    return "md"
+
+
+def resolve_output_path(args, share_id: str) -> Path:
+    """`-o file` without an extension gets the extension of the chosen format."""
+    ext = FORMAT_EXTENSIONS[output_format(args)]
+
+    if not args.output:
+        return Path(f"export_{share_id}{ext}")
+
+    out = Path(args.output)
+    if out.suffix:
+        return out
+    if out.is_dir():
+        return out / f"export_{share_id}{ext}"
+    return out.with_name(out.name + ext)
+
+
 def main():
     ap = _ArgumentParser(
         description="Export a DeepSeek shared conversation",
-        epilog="Example: %(prog)s https://chat.deepseek.com/share/nvy7v2ps1r6e2wyoyj",
+        epilog=(
+            "Example: %(prog)s https://chat.deepseek.com/share/nvy7v2ps1r6e2wyoyj\n"
+            "Without an extension -o file is saved as file.md (or file.json with --json)."
+        ),
     )
     ap.add_argument("link", help="Share URL or share ID")
-    ap.add_argument("-o", "--output", help="Output file path (default: auto-named)")
+    ap.add_argument(
+        "-o",
+        "--output",
+        help="Output file path (default: export_<share_id>.<ext>); "
+             "an extension-less path gets .md / .json / .txt of the chosen format",
+    )
     ap.add_argument("--json", action="store_true", help="Dump raw JSON instead of Markdown")
     ap.add_argument("--txt", action="store_true", help="Dump plain text")
     ap.add_argument("--token", help="Bearer token for auth (optional, needed for private shares)")
@@ -486,20 +522,18 @@ def main():
     share_id = extract_share_id(args.link)
     print(f"Share ID: {share_id}")
 
+    fmt = output_format(args)
+    if args.json and args.txt:
+        print("Note: both --json and --txt given, --json wins.")
+
+    out = resolve_output_path(args, share_id)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
     data = fetch_share(share_id, args.token)
 
-    if args.output:
-        out = Path(args.output)
-    elif args.json:
-        out = Path(f"export_{share_id}.json")
-    elif args.txt:
-        out = Path(f"export_{share_id}.txt")
-    else:
-        out = Path(f"export_{share_id}.md")
-
-    if args.json:
+    if fmt == "json":
         content = json.dumps(data, indent=2, ensure_ascii=False)
-    elif args.txt:
+    elif fmt == "txt":
         content = to_plain_text(data)
     else:
         content = to_markdown(data)
